@@ -45,6 +45,7 @@ pub(crate) struct PendingAltScreenRead {
     restore_started_at: Option<Instant>,
     observed_content_seq: u64,
     upward_events: usize,
+    unchanged_harvest_step: bool,
     reached_top: bool,
     valid: bool,
 }
@@ -83,6 +84,7 @@ impl PendingAltScreenRead {
             restore_started_at: None,
             observed_content_seq: content_seq,
             upward_events: 0,
+            unchanged_harvest_step: false,
             reached_top: false,
             valid: true,
         }
@@ -299,6 +301,7 @@ impl PendingAltScreenRead {
                 match merge {
                     UpwardMerge::Advanced { .. } => {
                         self.previous = snapshot;
+                        self.unchanged_harvest_step = false;
                         if self.history.len() >= self.lines {
                             self.start_restore(runtime, now, Some(snapshot_seq))
                         } else {
@@ -306,8 +309,13 @@ impl PendingAltScreenRead {
                         }
                     }
                     UpwardMerge::Unchanged if step_expired => {
-                        self.reached_top = true;
-                        self.start_restore(runtime, now, Some(snapshot_seq))
+                        if !self.unchanged_harvest_step {
+                            self.unchanged_harvest_step = true;
+                            self.start_harvest(runtime, now, snapshot_seq)
+                        } else {
+                            self.reached_top = true;
+                            self.start_restore(runtime, now, Some(snapshot_seq))
+                        }
                     }
                     UpwardMerge::Unaligned if step_expired => {
                         self.valid = false;
@@ -675,6 +683,116 @@ mod tests {
             response_text(&response_rx),
             "13\n14\n15\n16\n17\n18\n19\n20\n"
         );
+
+        drop(runtime);
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn unchanged_harvest_step_retries_before_declaring_top() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let initial = ["16", "17", "18", "19", "20"];
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 8);
+        runtime.test_process_pty_bytes(&draw(&initial, true));
+        let started = Instant::now();
+        let (pending, response_rx) = pending_read(&runtime, started, 8);
+        let harvest_started = started + INITIAL_QUIET + STEP_TIMEOUT;
+
+        let pending = pending
+            .poll(Some(&runtime), started + INITIAL_QUIET)
+            .expect("bottom probe");
+        input_rx.try_recv().expect("bottom wheel probe");
+        let pending = pending
+            .poll(Some(&runtime), harvest_started)
+            .expect("history harvest");
+        input_rx.try_recv().expect("first upward wheel batch");
+
+        let pending = pending
+            .poll(Some(&runtime), harvest_started + STEP_TIMEOUT)
+            .expect("unchanged harvest retry");
+        assert_eq!(pending.phase, Phase::Harvest);
+        assert_eq!(pending.upward_events, WHEEL_STEP_EVENTS * 2);
+        assert!(!pending.reached_top);
+        input_rx.try_recv().expect("second upward wheel batch");
+
+        runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17"], false));
+        let pending = pending
+            .poll(
+                Some(&runtime),
+                harvest_started + STEP_TIMEOUT + Duration::from_millis(1),
+            )
+            .expect("redraw coalescing");
+        let restore_started = harvest_started + STEP_TIMEOUT + Duration::from_millis(11);
+        let pending = pending
+            .poll(Some(&runtime), restore_started)
+            .expect("viewport restore");
+        input_rx.try_recv().expect("restore wheel batch");
+
+        runtime.test_process_pty_bytes(&draw(&initial, false));
+        let pending = pending
+            .poll(Some(&runtime), restore_started + Duration::from_millis(1))
+            .expect("restore redraw coalescing");
+        assert!(pending
+            .poll(Some(&runtime), restore_started + Duration::from_millis(11))
+            .is_none());
+        assert_eq!(
+            response_text(&response_rx),
+            "13\n14\n15\n16\n17\n18\n19\n20\n"
+        );
+
+        drop(runtime);
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn consecutive_unchanged_harvest_steps_confirm_top() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let initial = ["16", "17", "18", "19", "20"];
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 8);
+        runtime.test_process_pty_bytes(&draw(&initial, true));
+        let started = Instant::now();
+        let (pending, response_rx) = pending_read(&runtime, started, 8);
+        let harvest_started = started + INITIAL_QUIET + STEP_TIMEOUT;
+
+        let pending = pending
+            .poll(Some(&runtime), started + INITIAL_QUIET)
+            .expect("bottom probe");
+        input_rx.try_recv().expect("bottom wheel probe");
+        let pending = pending
+            .poll(Some(&runtime), harvest_started)
+            .expect("history harvest");
+        input_rx.try_recv().expect("first upward wheel batch");
+        let pending = pending
+            .poll(Some(&runtime), harvest_started + STEP_TIMEOUT)
+            .expect("unchanged harvest retry");
+        input_rx.try_recv().expect("second upward wheel batch");
+
+        let pending = pending
+            .poll(
+                Some(&runtime),
+                harvest_started + STEP_TIMEOUT.saturating_mul(2),
+            )
+            .expect("viewport restore");
+        assert_eq!(pending.phase, Phase::Restore);
+        assert!(pending.reached_top);
+        input_rx.try_recv().expect("restore wheel batch");
+        assert!(pending
+            .poll(
+                Some(&runtime),
+                harvest_started + STEP_TIMEOUT.saturating_mul(3),
+            )
+            .is_none());
+        assert_eq!(response_text(&response_rx), "16\n17\n18\n19\n20\n");
 
         drop(runtime);
         drop(_guard);
